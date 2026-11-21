@@ -1,0 +1,28 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  c-core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: C core tests (ASan + UBSan)
+        run: make test
+      - name: C core tests (TSan)
+        run: make -B test SAN=-fsanitize=thread
+
+  swift-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: C core tests on Darwin (F_BARRIERFSYNC / F_FULLFSYNC / clonefile paths)
+        run: make test
+      - name: swift test (macOS)
+        run: swift test
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild build -scheme FlashIO \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation
