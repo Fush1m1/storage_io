@@ -119,8 +119,8 @@ int fio_batch_delete(fio_batch *b, const void *key, size_t klen) {
 /* ================================================================== */
 /* store structures                                                   */
 /* ================================================================== */
-typedef struct entry {
-    struct entry *next;
+typedef struct fio_entry {
+    struct fio_entry *next;
     uint64_t hash;
     uint64_t voff;   /* value offset inside segment file */
     uint32_t seg;    /* segment id holding the newest record for this key */
@@ -129,14 +129,14 @@ typedef struct entry {
     uint32_t klen;
     uint8_t tomb;    /* newest record is a delete */
     uint8_t key[];
-} entry;
+} fio_entry;
 
-typedef struct segment {
+typedef struct fio_segment {
     uint32_t id;
     int fd;
     uint64_t size; /* logical size incl. still-buffered bytes (active only) */
     uint64_t live; /* bytes of records referenced by the index */
-} segment;
+} fio_segment;
 
 struct fio_store {
     pthread_rwlock_t lock;
@@ -144,14 +144,14 @@ struct fio_store {
     int lockfd;
     fio_options opt;
 
-    entry **buckets;
+    fio_entry **buckets;
     size_t nbuckets, nentries;
     uint64_t nkeys;
 
-    segment *segs; /* sorted by id; last one is active */
+    fio_segment *segs; /* sorted by id; last one is active */
     size_t nsegs, capsegs;
 
-    uint8_t *wbuf; /* coalescing buffer for the active segment */
+    uint8_t *wbuf; /* coalescing buffer for the active fio_segment */
     size_t wlen, wcap;
     uint64_t flushed; /* bytes of active segment already on disk */
 
@@ -168,20 +168,20 @@ static uint64_t hash_key(const void *k, size_t n) {
     return h ^ (h >> 29);
 }
 
-static entry *lookup(fio_store *s, const void *k, size_t kl, uint64_t h) {
-    for (entry *e = s->buckets[h & (s->nbuckets - 1)]; e; e = e->next)
+static fio_entry *lookup(fio_store *s, const void *k, size_t kl, uint64_t h) {
+    for (fio_entry *e = s->buckets[h & (s->nbuckets - 1)]; e; e = e->next)
         if (e->hash == h && e->klen == kl && memcmp(e->key, k, kl) == 0) return e;
     return NULL;
 }
 
 static int grow_table(fio_store *s) {
     size_t nb = s->nbuckets * 2;
-    entry **b = (entry **)calloc(nb, sizeof(entry *));
+    fio_entry **b = (fio_entry **)calloc(nb, sizeof(fio_entry *));
     if (!b) return FIO_ENOMEM;
     for (size_t i = 0; i < s->nbuckets; i++) {
-        entry *e = s->buckets[i];
+        fio_entry *e = s->buckets[i];
         while (e) {
-            entry *next = e->next;
+            fio_entry *next = e->next;
             size_t j = e->hash & (nb - 1);
             e->next = b[j];
             b[j] = e;
@@ -194,7 +194,7 @@ static int grow_table(fio_store *s) {
     return FIO_OK;
 }
 
-static segment *find_seg(fio_store *s, uint32_t id) {
+static fio_segment *find_seg(fio_store *s, uint32_t id) {
     size_t lo = 0, hi = s->nsegs;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
@@ -204,7 +204,7 @@ static segment *find_seg(fio_store *s, uint32_t id) {
     return NULL;
 }
 
-static segment *active(fio_store *s) { return &s->segs[s->nsegs - 1]; }
+static fio_segment *active(fio_store *s) { return &s->segs[s->nsegs - 1]; }
 
 static void seg_path(const fio_store *s, uint32_t id, char *buf, size_t cap) {
     snprintf(buf, cap, "%s/%010u.seg", s->dir, id);
@@ -215,12 +215,12 @@ static size_t path_cap(const fio_store *s) { return strlen(s->dir) + 32; }
 static int push_seg(fio_store *s, uint32_t id, int fd, uint64_t size) {
     if (s->nsegs == s->capsegs) {
         size_t nc = s->capsegs ? s->capsegs * 2 : 8;
-        segment *ns = (segment *)realloc(s->segs, nc * sizeof(segment));
+        fio_segment *ns = (fio_segment *)realloc(s->segs, nc * sizeof(fio_segment));
         if (!ns) return FIO_ENOMEM;
         s->segs = ns;
         s->capsegs = nc;
     }
-    segment *g = &s->segs[s->nsegs++];
+    fio_segment *g = &s->segs[s->nsegs++];
     g->id = id; g->fd = fd; g->size = size; g->live = 0;
     return FIO_OK;
 }
@@ -249,7 +249,7 @@ static int validate_payload(const uint8_t *p, size_t len, uint32_t count) {
 }
 
 /* Apply already-validated ops located at file offset frame_off of seg. */
-static int apply_ops(fio_store *s, segment *seg, uint64_t frame_off,
+static int apply_ops(fio_store *s, fio_segment *seg, uint64_t frame_off,
                      const uint8_t *p, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -258,16 +258,16 @@ static int apply_ops(fio_store *s, segment *seg, uint64_t frame_off,
         const uint8_t *key = p + off + OP_HDR;
         uint32_t rec = OP_HDR + kl + vl;
         uint64_t h = hash_key(key, kl);
-        entry *e = lookup(s, key, kl, h);
+        fio_entry *e = lookup(s, key, kl, h);
 
         if (e) {
-            segment *old = find_seg(s, e->seg);
+            fio_segment *old = find_seg(s, e->seg);
             if (old) old->live -= e->rec;
         }
         if (type == OP_PUT) {
             if (!e) {
                 if (s->nentries >= s->nbuckets && grow_table(s) != FIO_OK) return FIO_ENOMEM;
-                e = (entry *)malloc(sizeof(entry) + kl);
+                e = (fio_entry *)malloc(sizeof(fio_entry) + kl);
                 if (!e) return FIO_ENOMEM;
                 e->hash = h;
                 e->klen = kl;
@@ -303,7 +303,7 @@ static int apply_ops(fio_store *s, segment *seg, uint64_t frame_off,
 /* ================================================================== */
 static int flush_buf(fio_store *s) {
     if (s->wlen == 0) return FIO_OK;
-    segment *a = active(s);
+    fio_segment *a = active(s);
     int rc = fio_pwrite_all(a->fd, s->wbuf, s->wlen, s->flushed);
     if (rc != FIO_OK) return poison(s, rc);
     s->flushed += s->wlen;
@@ -372,7 +372,7 @@ static int append_frame(fio_store *s, const uint8_t *payload, size_t plen,
     memcpy(f + FRAME_HDR, payload, plen);
     put_u32(f + 4, fio_crc32c(0, f + 8, flen - 8));
 
-    segment *a = active(s);
+    fio_segment *a = active(s);
     uint64_t frame_off = a->size;
     a->size += flen;
     s->wlen += flen;
@@ -390,7 +390,7 @@ static int append_frame(fio_store *s, const uint8_t *payload, size_t plen,
 /* ================================================================== */
 static int compact_one(fio_store *s, uint32_t vid, uint32_t min_remaining,
                        fio_batch *b) {
-    segment *v = find_seg(s, vid);
+    fio_segment *v = find_seg(s, vid);
     if (!v || v->live == 0) return FIO_OK; /* nothing references it */
     uint64_t vsize = v->size;
     uint8_t *mem = NULL;
@@ -413,9 +413,9 @@ static int compact_one(fio_store *s, uint32_t vid, uint32_t min_remaining,
     }
 
     for (size_t i = 0; i < s->nbuckets && rc == FIO_OK; i++) {
-        entry **pp = &s->buckets[i];
+        fio_entry **pp = &s->buckets[i];
         while (*pp && rc == FIO_OK) {
-            entry *e = *pp;
+            fio_entry *e = *pp;
             if (e->seg != vid) { pp = &e->next; continue; }
             if (!e->tomb) {
                 if (e->voff + e->vlen > vsize) { rc = FIO_ECORRUPT; break; }
@@ -455,7 +455,7 @@ static int compact_locked(fio_store *s) {
     if (!victims) return FIO_ENOMEM;
     uint32_t min_remaining = active(s)->id;
     for (size_t i = 0; i < nsealed; i++) {
-        segment *g = &s->segs[i];
+        fio_segment *g = &s->segs[i];
         double garbage = g->size ? 1.0 - (double)g->live / (double)g->size : 1.0;
         if (garbage >= s->opt.compaction_threshold) victims[nv++] = g->id;
         else if (g->id < min_remaining) min_remaining = g->id;
@@ -476,13 +476,13 @@ static int compact_locked(fio_store *s) {
     char *path = (char *)malloc(path_cap(s));
     if (!path) { free(victims); return FIO_ENOMEM; }
     for (size_t i = 0; i < nv; i++) { /* ascending id order */
-        segment *g = find_seg(s, victims[i]);
+        fio_segment *g = find_seg(s, victims[i]);
         if (!g) continue;
         seg_path(s, g->id, path, path_cap(s));
         uint64_t sz = g->size;
         close(g->fd);
         size_t idx = (size_t)(g - s->segs);
-        memmove(&s->segs[idx], &s->segs[idx + 1], (s->nsegs - idx - 1) * sizeof(segment));
+        memmove(&s->segs[idx], &s->segs[idx + 1], (s->nsegs - idx - 1) * sizeof(fio_segment));
         s->nsegs--;
         if (unlink(path) != 0 && errno != ENOENT) { rc = poison(s, -errno); break; }
         /* Order the unlinks: an older victim must never outlive a newer one
@@ -540,7 +540,7 @@ static int load_segment(fio_store *s, uint32_t id) {
     uint64_t size = (uint64_t)stbuf.st_size;
     int rc = push_seg(s, id, fd, 0);
     if (rc != FIO_OK) { close(fd); return rc; }
-    segment *g = active(s);
+    fio_segment *g = active(s);
 
     uint8_t *mem = (uint8_t *)malloc(size ? size : 1);
     if (!mem) return FIO_ENOMEM;
@@ -573,8 +573,8 @@ static int load_segment(fio_store *s, uint32_t id) {
 static void free_store(fio_store *s) {
     if (!s) return;
     for (size_t i = 0; i < s->nbuckets; i++) {
-        entry *e = s->buckets[i];
-        while (e) { entry *n = e->next; free(e); e = n; }
+        fio_entry *e = s->buckets[i];
+        while (e) { fio_entry *n = e->next; free(e); e = n; }
     }
     free(s->buckets);
     for (size_t i = 0; i < s->nsegs; i++) close(s->segs[i].fd);
@@ -603,7 +603,7 @@ int fio_store_open(const char *dir, const fio_options *opt, fio_store **out) {
     int rc = FIO_OK;
     s->dir = strdup(dir);
     s->nbuckets = 1024;
-    s->buckets = (entry **)calloc(s->nbuckets, sizeof(entry *));
+    s->buckets = (fio_entry **)calloc(s->nbuckets, sizeof(fio_entry *));
     if (!s->dir || !s->buckets) { rc = FIO_ENOMEM; goto fail; }
 
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) { rc = -errno; goto fail; }
@@ -706,7 +706,7 @@ int fio_store_delete(fio_store *s, const void *key, size_t klen, fio_durability 
     if (!s || !key || klen == 0 || klen > FIO_MAX_KEY_SIZE) return FIO_EINVAL;
     pthread_rwlock_wrlock(&s->lock);
     int rc;
-    entry *e = lookup(s, key, klen, hash_key(key, klen));
+    fio_entry *e = lookup(s, key, klen, hash_key(key, klen));
     if (!e || e->tomb) {
         /* nothing to delete: write nothing (saves flash), still honour d */
         rc = s->err != FIO_OK ? FIO_EPOISONED
@@ -728,11 +728,11 @@ int fio_store_get(fio_store *s, const void *key, size_t klen,
     *vlen = 0;
     pthread_rwlock_rdlock(&s->lock);
     int rc = FIO_OK;
-    entry *e = lookup(s, key, klen, hash_key(key, klen));
+    fio_entry *e = lookup(s, key, klen, hash_key(key, klen));
     if (s->err != FIO_OK) rc = FIO_EPOISONED;
     else if (!e || e->tomb) rc = FIO_ENOTFOUND;
     else {
-        segment *g = find_seg(s, e->seg);
+        fio_segment *g = find_seg(s, e->seg);
         uint8_t *out = (uint8_t *)malloc(e->vlen ? e->vlen : 1);
         if (!g) rc = FIO_ECORRUPT;
         else if (!out) rc = FIO_ENOMEM;
@@ -786,7 +786,7 @@ int fio_store_foreach_key(fio_store *s, fio_key_fn fn, void *ctx) {
     pthread_rwlock_rdlock(&s->lock);
     int stop = 0;
     for (size_t i = 0; i < s->nbuckets && !stop; i++)
-        for (entry *e = s->buckets[i]; e && !stop; e = e->next)
+        for (fio_entry *e = s->buckets[i]; e && !stop; e = e->next)
             if (!e->tomb) stop = fn(e->key, e->klen, ctx);
     pthread_rwlock_unlock(&s->lock);
     return FIO_OK;
